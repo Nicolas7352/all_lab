@@ -1,0 +1,721 @@
+1. Миграции
+
+Выполните команды для создания файлов миграций:
+bash
+
+php artisan make:migration create_roles_table
+php artisan make:migration create_categories_table
+php artisan make:migration add_login_and_role_to_users_table
+php artisan make:migration create_texts_table
+
+create_roles_table.php
+php
+
+public function up(): void
+{
+    Schema::create('roles', function (Blueprint $table) {
+        $table->id();
+        $table->string('name')->unique();
+        $table->timestamps();
+    });
+}
+
+create_categories_table.php
+php
+
+public function up(): void
+{
+    Schema::create('categories', function (Blueprint $table) {
+        $table->id();
+        $table->string('name')->unique();
+        $table->timestamps();
+    });
+}
+
+add_login_and_role_to_users_table.php
+php
+
+public function up(): void
+{
+    Schema::table('users', function (Blueprint $table) {
+        $table->string('login')->unique()->after('id');
+        $table->foreignId('role_id')->after('login')->constrained('roles');
+        $table->dropColumn(['name', 'email']);
+    });
+}
+
+create_texts_table.php
+php
+
+public function up(): void
+{
+    Schema::create('texts', function (Blueprint $table) {
+        $table->id();
+        $table->string('heading');
+        $table->text('text');
+        $table->foreignId('category_id')->constrained('categories')->restrictOnDelete();
+        $table->foreignId('user_id')->constrained('users')->cascadeOnDelete();
+        $table->boolean('is_blocked')->default(false);
+        $table->timestamps();
+    });
+}
+
+2. Модели
+
+app/Models/Role.php
+php
+
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+
+class Role extends Model
+{
+    protected $fillable = ['name'];
+    public function users() { return $this->hasMany(User::class); }
+}
+
+app/Models/Category.php
+php
+
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+
+class Category extends Model
+{
+    protected $fillable = ['name'];
+    public function texts() { return $this->hasMany(Text::class); }
+}
+
+app/Models/Text.php
+php
+
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+
+class Text extends Model
+{
+    protected $fillable = ['heading', 'text', 'category_id', 'user_id', 'is_blocked'];
+    protected $casts = ['is_blocked' => 'boolean'];
+
+    public function category() { return $this->belongsTo(Category::class); }
+    public function author() { return $this->belongsTo(User::class, 'user_id'); }
+}
+
+app/Models/User.php (замените стандартный)
+php
+
+<?php
+namespace App\Models;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+
+class User extends Authenticatable
+{
+    use Notifiable;
+    protected $fillable = ['login', 'password', 'role_id'];
+    protected $hidden = ['password', 'remember_token'];
+
+    public function role() { return $this->belongsTo(Role::class); }
+    public function texts() { return $this->hasMany(Text::class); }
+
+    public function isAdmin(): bool { return $this->role?->name === 'admin'; }
+    public function isJournalist(): bool { return $this->role?->name === 'journalist'; }
+}
+
+3. Middleware
+
+app/Http/Middleware/EnsureUserHasRole.php
+php
+
+<?php
+namespace App\Http\Middleware;
+use Closure;
+use Illuminate\Http\Request;
+
+class EnsureUserHasRole
+{
+    public function handle(Request $request, Closure $next, string ...$roles)
+    {
+        if (!$request->user() || !in_array($request->user()->role->name, $roles)) {
+            abort(403, 'У вас нет прав для доступа к этой странице.');
+        }
+        return $next($request);
+    }
+}
+
+Не забудьте зарегистрировать алиас в bootstrap/app.php:
+php
+
+->withMiddleware(function (Middleware $middleware) {
+    $middleware->alias(['role' => \App\Http\Middleware\EnsureUserHasRole::class]);
+})
+
+4. Контроллеры
+
+app/Http/Controllers/Auth/LoginController.php
+php
+
+<?php
+namespace App\Http\Controllers\Auth;
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+
+class LoginController extends Controller
+{
+    public function show() { return view('auth.login'); }
+
+    public function login(Request $request)
+    {
+        $credentials = $request->validate([
+            'login' => ['required', 'string'],
+            'password' => ['required', 'string'],
+        ]);
+
+        if (Auth::attempt($credentials)) {
+            $request->session()->regenerate();
+            return redirect()->intended('/');
+        }
+        return back()->withErrors(['login' => 'Неверный логин или пароль.'])->onlyInput('login');
+    }
+
+    public function logout(Request $request)
+    {
+        Auth::logout();
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+        return redirect('/');
+    }
+}
+
+app/Http/Controllers/Auth/RegisterController.php
+php
+
+<?php
+namespace App\Http\Controllers\Auth;
+use App\Http\Controllers\Controller;
+use App\Models\Role;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Hash;
+
+class RegisterController extends Controller
+{
+    public function show() { return view('auth.register'); }
+
+    public function store(Request $request)
+    {
+        $data = $request->validate([
+            'login' => ['required', 'string', 'unique:users,login', 'max:255'],
+            'password' => ['required', 'string', 'min:6', 'confirmed'],
+        ]);
+
+        $user = User::create([
+            'login' => $data['login'],
+            'password' => Hash::make($data['password']),
+            'role_id' => Role::where('name', 'user')->first()->id,
+        ]);
+
+        Auth::login($user);
+        return redirect('/')->with('success', 'Регистрация прошла успешно!');
+    }
+}
+
+app/Http/Controllers/HomeController.php
+php
+
+<?php
+namespace App\Http\Controllers;
+use App\Models\Text;
+
+class HomeController extends Controller
+{
+    public function index()
+    {
+        $texts = Text::with(['category', 'author'])
+            ->where('is_blocked', false)
+            ->latest()
+            ->paginate(6);
+        return view('home', compact('texts'));
+    }
+}
+
+app/Http/Controllers/CategoryController.php
+php
+
+<?php
+namespace App\Http\Controllers;
+use App\Models\Category;
+use App\Models\Text;
+
+class CategoryController extends Controller
+{
+    public function index()
+    {
+        $categories = Category::all();
+        return view('category.index', compact('categories'));
+    }
+
+    public function show(Category $category)
+    {
+        $texts = $category->texts()
+            ->with('author')
+            ->where('is_blocked', false)
+            ->latest()
+            ->paginate(6);
+        return view('category.show', compact('category', 'texts'));
+    }
+}
+
+app/Http/Controllers/JournalistController.php
+php
+
+<?php
+namespace App\Http\Controllers;
+use App\Models\Category;
+use App\Models\Text;
+use Illuminate\Http\Request;
+
+class JournalistController extends Controller
+{
+    public function create()
+    {
+        $categories = Category::all();
+        return view('journalist.create', compact('categories'));
+    }
+
+    public function store(Request $request)
+    {
+        $data = $request->validate([
+            'heading' => ['required', 'string', 'max:255'],
+            'category_id' => ['required', 'exists:categories,id'],
+            'text' => ['required', 'string'],
+        ]);
+
+        Text::create([
+            'heading' => $data['heading'],
+            'category_id' => $data['category_id'],
+            'text' => $data['text'],
+            'user_id' => auth()->id(),
+        ]);
+
+        return redirect('/journalist')->with('success', 'Статья успешно опубликована!');
+    }
+}
+
+app/Http/Controllers/AdminController.php
+php
+
+<?php
+namespace App\Http\Controllers;
+use App\Models\Role;
+use App\Models\Text;
+use App\Models\User;
+use Illuminate\Http\Request;
+
+class AdminController extends Controller
+{
+    public function index()
+    {
+        $texts = Text::with(['category', 'author'])->latest()->paginate(10);
+        $users = User::with('role')->get();
+        $roles = Role::all();
+        return view('admin.index', compact('texts', 'users', 'roles'));
+    }
+
+    public function destroyText(Text $text)
+    {
+        $text->delete();
+        return back()->with('success', 'Статья удалена.');
+    }
+
+    public function toggleBlock(Text $text)
+    {
+        $text->update(['is_blocked' => !$text->is_blocked]);
+        return back()->with('success', 'Статус статьи изменён.');
+    }
+
+    public function updateRole(Request $request, User $user)
+    {
+        $data = $request->validate(['role_id' => ['required', 'exists:roles,id']]);
+        $user->update(['role_id' => $data['role_id']]);
+        return back()->with('success', 'Роль пользователя обновлена.');
+    }
+}
+
+5. Маршруты (routes/web.php)
+php
+
+<?php
+use App\Http\Controllers\Auth\LoginController;
+use App\Http\Controllers\Auth\RegisterController;
+use App\Http\Controllers\HomeController;
+use App\Http\Controllers\CategoryController;
+use App\Http\Controllers\JournalistController;
+use App\Http\Controllers\AdminController;
+use Illuminate\Support\Facades\Route;
+
+Route::get('/login', [LoginController::class, 'show'])->name('login');
+Route::post('/login', [LoginController::class, 'login']);
+Route::get('/register', [RegisterController::class, 'show']);
+Route::post('/register', [RegisterController::class, 'store']);
+Route::post('/logout', [LoginController::class, 'logout'])->middleware('auth');
+
+Route::get('/', [HomeController::class, 'index'])->name('home');
+Route::get('/categories', [CategoryController::class, 'index'])->name('categories');
+Route::get('/category/{category}', [CategoryController::class, 'show'])->name('category.show');
+
+Route::middleware(['auth', 'role:journalist,admin'])->group(function () {
+    Route::get('/journalist', [JournalistController::class, 'create'])->name('journalist.create');
+    Route::post('/journalist', [JournalistController::class, 'store'])->name('journalist.store');
+});
+
+Route::middleware(['auth', 'role:admin'])->prefix('admin')->group(function () {
+    Route::get('/', [AdminController::class, 'index'])->name('admin.index');
+    Route::delete('/text/{text}', [AdminController::class, 'destroyText'])->name('admin.text.destroy');
+    Route::patch('/text/{text}/block', [AdminController::class, 'toggleBlock'])->name('admin.text.block');
+    Route::post('/user/{user}/role', [AdminController::class, 'updateRole'])->name('admin.user.role');
+});
+
+6. Сидер
+
+database/seeders/DatabaseSeeder.php
+php
+
+<?php
+namespace Database\Seeders;
+use App\Models\Category;
+use App\Models\Role;
+use App\Models\User;
+use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\Hash;
+
+class DatabaseSeeder extends Seeder
+{
+    public function run(): void
+    {
+        Role::create(['name' => 'admin']);
+        Role::create(['name' => 'journalist']);
+        Role::create(['name' => 'user']);
+
+        User::create([
+            'login' => 'admin',
+            'password' => Hash::make('password'),
+            'role_id' => Role::where('name', 'admin')->first()->id,
+        ]);
+        User::create([
+            'login' => 'journalist',
+            'password' => Hash::make('password'),
+            'role_id' => Role::where('name', 'journalist')->first()->id,
+        ]);
+
+        Category::create(['name' => 'Технологии']);
+        Category::create(['name' => 'Наука']);
+        Category::create(['name' => 'Космос']);
+    }
+}
+
+7. Шаблоны Blade
+
+resources/views/layouts/app.blade.php
+blade
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Новостной сайт</title>
+    @vite(['resources/css/app.css', 'resources/js/app.js'])
+</head>
+<body class="bg-gray-50">
+    <x-header />
+    <main class="container mx-auto px-4 py-8">
+        @if(session('success'))
+            <div class="bg-green-100 text-green-800 p-3 mb-4 rounded">{{ session('success') }}</div>
+        @endif
+        @yield('content')
+    </main>
+    <x-footer />
+</body>
+</html>
+
+resources/views/components/header.blade.php
+blade
+
+<header class="bg-white shadow">
+    <div class="container mx-auto px-4 py-4 flex justify-between items-center">
+        <a href="{{ route('home') }}" class="text-xl font-bold">Новости</a>
+        <nav class="flex gap-4 items-center">
+            <a href="{{ route('home') }}">Главная</a>
+            <a href="{{ route('categories') }}">Категории</a>
+            @auth
+                @if(auth()->user()->isJournalist() || auth()->user()->isAdmin())
+                    <a href="{{ route('journalist.create') }}">Журналист</a>
+                @endif
+                @if(auth()->user()->isAdmin())
+                    <a href="{{ route('admin.index') }}">Админка</a>
+                @endif
+                <form method="POST" action="{{ route('logout') }}">
+                    @csrf
+                    <button type="submit">Выйти ({{ auth()->user()->login }})</button>
+                </form>
+            @else
+                <a href="{{ route('login') }}">Вход</a>
+                <a href="{{ route('register') }}">Регистрация</a>
+            @endauth
+        </nav>
+    </div>
+</header>
+
+resources/views/components/footer.blade.php
+blade
+
+<footer class="bg-gray-800 text-white text-center py-4 mt-8">
+    &copy; {{ date('Y') }} Новостной сайт. Все права защищены.
+</footer>
+
+resources/views/home.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Все новости</h1>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    @foreach($texts as $text)
+        <article class="bg-white p-4 rounded shadow">
+            <h2 class="text-xl font-semibold">{{ $text->heading }}</h2>
+            <p class="text-sm text-gray-500">
+                Категория: <a href="{{ route('category.show', $text->category) }}" class="text-blue-600">{{ $text->category->name }}</a>
+                | Автор: {{ $text->author->login }}
+                | {{ $text->created_at->format('d.m.Y') }}
+            </p>
+            <p class="mt-2">{{ Str::limit($text->text, 200) }}</p>
+        </article>
+    @endforeach
+</div>
+<div class="mt-6">{{ $texts->links() }}</div>
+@endsection
+
+resources/views/category/index.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Категории</h1>
+<ul class="space-y-2">
+    @foreach($categories as $category)
+        <li><a href="{{ route('category.show', $category) }}" class="text-blue-600">{{ $category->name }}</a></li>
+    @endforeach
+</ul>
+@endsection
+
+resources/views/category/show.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Категория: {{ $category->name }}</h1>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    @forelse($texts as $text)
+        <article class="bg-white p-4 rounded shadow">
+            <h2 class="text-xl font-semibold">{{ $text->heading }}</h2>
+            <p class="text-sm text-gray-500">Автор: {{ $text->author->login }} | {{ $text->created_at->format('d.m.Y') }}</p>
+            <p class="mt-2">{{ Str::limit($text->text, 200) }}</p>
+        </article>
+    @empty
+        <p>В этой категории пока нет статей.</p>
+    @endforelse
+</div>
+<div class="mt-6">{{ $texts->links() }}</div>
+@endsection
+
+resources/views/journalist/create.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Написать статью</h1>
+<form method="POST" action="{{ route('journalist.store') }}" class="bg-white p-6 rounded shadow space-y-4">
+    @csrf
+    <div>
+        <label class="block font-medium">Заголовок</label>
+        <input type="text" name="heading" value="{{ old('heading') }}" class="w-full border p-2 rounded" required>
+        @error('heading')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <div>
+        <label class="block font-medium">Категория</label>
+        <select name="category_id" class="w-full border p-2 rounded" required>
+            <option value="">Выберите категорию</option>
+            @foreach($categories as $category)
+                <option value="{{ $category->id }}" @selected(old('category_id') == $category->id)>{{ $category->name }}</option>
+            @endforeach
+        </select>
+        @error('category_id')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <div>
+        <label class="block font-medium">Текст статьи</label>
+        <textarea name="text" rows="10" class="w-full border p-2 rounded" required>{{ old('text') }}</textarea>
+        @error('text')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded">Опубликовать</button>
+</form>
+@endsection
+
+resources/views/admin/index.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Админ-панель</h1>
+
+<h2 class="text-xl font-semibold mt-6 mb-2">Управление статьями</h2>
+<table class="w-full bg-white rounded shadow">
+    <thead class="bg-gray-100">
+        <tr>
+            <th class="p-2 text-left">Заголовок</th>
+            <th class="p-2 text-left">Автор</th>
+            <th class="p-2 text-left">Статус</th>
+            <th class="p-2 text-left">Действия</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach($texts as $text)
+        <tr class="border-t">
+            <td class="p-2">{{ $text->heading }}</td>
+            <td class="p-2">{{ $text->author->login }}</td>
+            <td class="p-2">{{ $text->is_blocked ? 'Заблокирована' : 'Активна' }}</td>
+            <td class="p-2 space-x-2">
+                <form method="POST" action="{{ route('admin.text.block', $text) }}" class="inline">
+                    @csrf @method('PATCH')
+                    <button type="submit" class="text-yellow-600">{{ $text->is_blocked ? 'Разблокировать' : 'Блокировать' }}</button>
+                </form>
+                <form method="POST" action="{{ route('admin.text.destroy', $text) }}" class="inline" onsubmit="return confirm('Удалить статью?')">
+                    @csrf @method('DELETE')
+                    <button type="submit" class="text-red-600">Удалить</button>
+                </form>
+            </td>
+        </tr>
+        @endforeach
+    </tbody>
+</table>
+<div class="mt-4">{{ $texts->links() }}</div>
+
+<h2 class="text-xl font-semibold mt-8 mb-2">Пользователи и роли</h2>
+<table class="w-full bg-white rounded shadow">
+    <thead class="bg-gray-100">
+        <tr>
+            <th class="p-2 text-left">Логин</th>
+            <th class="p-2 text-left">Роль</th>
+            <th class="p-2 text-left">Изменить роль</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach($users as $user)
+        <tr class="border-t">
+            <td class="p-2">{{ $user->login }}</td>
+            <td class="p-2">{{ $user->role->name }}</td>
+            <td class="p-2">
+                <form method="POST" action="{{ route('admin.user.role', $user) }}" class="flex gap-2">
+                    @csrf
+                    <select name="role_id" class="border p-1 rounded">
+                        @foreach($roles as $role)
+                            <option value="{{ $role->id }}" @selected($user->role_id === $role->id)>{{ $role->name }}</option>
+                        @endforeach
+                    </select>
+                    <button type="submit" class="bg-blue-600 text-white px-2 py-1 rounded">Сохранить</button>
+                </form>
+            </td>
+        </tr>
+        @endforeach
+    </tbody>
+</table>
+@endsection
+
+resources/views/auth/login.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Вход</h1>
+<form method="POST" action="{{ route('login') }}" class="bg-white p-6 rounded shadow space-y-4 max-w-md">
+    @csrf
+    <div>
+        <label class="block font-medium">Логин</label>
+        <input type="text" name="login" value="{{ old('login') }}" class="w-full border p-2 rounded" required>
+        @error('login')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <div>
+        <label class="block font-medium">Пароль</label>
+        <input type="password" name="password" class="w-full border p-2 rounded" required>
+        @error('password')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded">Войти</button>
+</form>
+<p class="mt-4">Нет аккаунта? <a href="{{ route('register') }}" class="text-blue-600">Регистрация</a></p>
+@endsection
+
+resources/views/auth/register.blade.php
+blade
+
+@extends('layouts.app')
+@section('content')
+<h1 class="text-2xl font-bold mb-4">Регистрация</h1>
+<form method="POST" action="{{ route('register') }}" class="bg-white p-6 rounded shadow space-y-4 max-w-md">
+    @csrf
+    <div>
+        <label class="block font-medium">Логин</label>
+        <input type="text" name="login" value="{{ old('login') }}" class="w-full border p-2 rounded" required>
+        @error('login')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <div>
+        <label class="block font-medium">Пароль</label>
+        <input type="password" name="password" class="w-full border p-2 rounded" required>
+        @error('password')<span class="text-red-600">{{ $message }}</span>@enderror
+    </div>
+    <div>
+        <label class="block font-medium">Подтверждение пароля</label>
+        <input type="password" name="password_confirmation" class="w-full border p-2 rounded" required>
+    </div>
+    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded">Зарегистрироваться</button>
+</form>
+<p class="mt-4">Уже есть аккаунт? <a href="{{ route('login') }}" class="text-blue-600">Войти</a></p>
+@endsection
+
+8. Финальные шаги
+
+    Установите Tailwind CSS (если не установлен), чтобы классы работали:
+
+bash
+
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+
+В resources/css/app.css добавьте:
+css
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+В tailwind.config.js укажите пути к шаблонам:
+js
+
+content: ["./resources/**/*.blade.php", "./resources/**/*.js"],
+
+Затем npm run build.
+
+    Выполните миграции и сидер:
+
+bash
+
+php artisan migrate:fresh --seed
+
+    Запустите сервер:
+
+bash
+
+php artisan serve
